@@ -4,6 +4,7 @@ import {
   VideoMetadata,
   ProcessResponse,
   UploadResponse,
+  ProcessOptions,
 } from "../types/video";
 
 const api = axios.create({
@@ -29,10 +30,12 @@ export const videoService = {
   process: async (
     path: string,
     interval: number = 10,
+    options?: ProcessOptions,
   ): Promise<ProcessResponse> => {
     const response = await api.post("/process", {
       path: path.trim(),
       interval,
+      options: options || {},
     });
     return response.data;
   },

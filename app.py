@@ -73,6 +73,16 @@ def process_video():
 
     raw_path = data['path'].strip()
     interval = int(data.get('interval', 10))
+    options = data.get('options', {})
+
+    # Опции по умолчанию
+    default_options = {
+        'detect_faces': False,
+        'detect_people': False,
+        'describe_frame': False,
+        'nsfw': False
+    }
+    default_options.update(options)
 
     try:
         file_path = resolve_file_path(raw_path)
@@ -83,44 +93,40 @@ def process_video():
         filename = os.path.basename(file_path)
         video_name = os.path.splitext(filename)[0]
 
-        # Очищаем завершенные процессоры
         cleanup_finished_processors()
 
-        # Проверяем, не обрабатывается ли уже
         if video_name in active_processors:
             processor = active_processors[video_name]
             if processor.is_alive():
                 return jsonify({
                     'status': 'already_processing',
                     'video_name': video_name,
-                    'message': 'Video is already being processed'
                 }), 200
             else:
                 del active_processors[video_name]
 
-        # Создаем и запускаем процессор
         processor = VideoProcessor(
             input_path=file_path,
             output_base_dir=PROCESSED_FOLDER,
-            video_name=video_name
+            video_name=video_name,
+            options=default_options
         )
 
         processor.process_async(interval=interval)
         active_processors[video_name] = processor
 
-        logger.info(f"Started processing: {video_name}")
+        logger.info(
+            f"Started processing: {video_name} with options: {default_options}")
 
         return jsonify({
             'status': 'processing',
             'video_name': video_name,
             'source_path': file_path,
             'interval': interval,
+            'options': default_options,
             'message': f'Started processing {filename}'
         }), 200
 
-    except FileNotFoundError as e:
-        logger.warning(f"File not found: {e}")
-        return jsonify({'error': str(e)}), 404
     except Exception as e:
         logger.error(f"Process error: {e}")
         return jsonify({'error': str(e)}), 500

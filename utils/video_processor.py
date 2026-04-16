@@ -6,12 +6,13 @@ import time
 from datetime import timedelta
 from threading import Thread, Event
 import logging
+from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
 
 class VideoProcessor:
-    def __init__(self, input_path, output_base_dir, video_name):
+    def __init__(self, input_path, output_base_dir, video_name, options=None):
         self.input_path = input_path
         self.video_name = video_name
         self.output_dir = os.path.join(output_base_dir, video_name)
@@ -23,8 +24,28 @@ class VideoProcessor:
         self._completed = False
         self._error = None
 
+        # Опции обработки
+        self.options = options or {
+            'detect_faces': False,
+            'detect_people': False,
+            'describe_frame': False,
+            'nsfw': False
+        }
+
+        # Детектор лиц (ленивая инициализация)
+        self._face_detector = None
+
         os.makedirs(self.frames_dir, exist_ok=True)
-        logger.info(f"[{video_name}] Processor initialized")
+        logger.info(
+            f"[{video_name}] Processor initialized with options: {self.options}")
+
+    @property
+    def face_detector(self):
+        """Ленивая инициализация детектора лиц."""
+        if self._face_detector is None and self.options.get('detect_faces'):
+            from utils.face_detector import get_face_detector
+            self._face_detector = get_face_detector()
+        return self._face_detector
 
     def get_duration(self):
         """Получает продолжительность видео."""
@@ -38,9 +59,7 @@ class VideoProcessor:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     timeout=30)
             if result.returncode == 0 and result.stdout.strip():
-                duration = float(result.stdout.strip())
-                logger.info(f"[{self.video_name}] Duration: {duration}s")
-                return duration
+                return float(result.stdout.strip())
         except Exception as e:
             logger.error(f"[{self.video_name}] Error getting duration: {e}")
 
@@ -63,21 +82,22 @@ class VideoProcessor:
             'frames_interval': interval,
             'total_frames_estimated': total_frames_estimated,
             'frames_processed': 0,
-            'frames': []
+            'frames': [],
+            'options': self.options,
+            'statistics': {
+                'total_faces_detected': 0
+            }
         }
 
         self._write_json(metadata)
-        logger.info(f"[{self.video_name}] Initial metadata created")
         return metadata
 
     def _write_json(self, data):
         """Безопасная запись JSON."""
         try:
-            # Сначала пишем во временный файл
             temp_path = self.json_path + '.tmp'
             with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            # Затем атомарно заменяем
             os.replace(temp_path, self.json_path)
         except Exception as e:
             logger.error(f"[{self.video_name}] Error writing JSON: {e}")
@@ -97,13 +117,19 @@ class VideoProcessor:
         """Возвращает список существующих кадров."""
         if not os.path.exists(self.frames_dir):
             return []
-        frames = sorted(
+        return sorted(
             [f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')])
-        logger.debug(f"[{self.video_name}] Found {len(frames)} frames")
-        return frames
+
+    def detect_faces_on_frame(self, frame_path: str) -> Dict[str, Any]:
+        """Определяет лица на одном кадре."""
+        if not self.face_detector:
+            return {'faces_count': 0, 'faces': [],
+                    'error': 'Face detector not initialized'}
+
+        return self.face_detector.detect_faces(frame_path)
 
     def update_metadata(self, interval):
-        """Обновляет JSON с текущими кадрами."""
+        """Обновляет JSON с текущими кадрами и распознаванием."""
         metadata = self._read_json()
         if not metadata:
             return
@@ -111,28 +137,49 @@ class VideoProcessor:
         frame_files = self.scan_existing_frames()
         existing_filenames = {f['filename'] for f in metadata['frames']}
 
+        total_faces = metadata.get('statistics', {}).get('total_faces_detected',
+                                                         0)
         changed = False
+
         for filename in frame_files:
+            frame_path = os.path.join(self.frames_dir, filename)
+
             if filename not in existing_filenames:
                 match = re.search(r'_(\d+)\.jpg$', filename)
                 if match:
                     frame_num = int(match.group(1))
                     seconds = (frame_num - 1) * interval
 
-                    metadata['frames'].append({
+                    frame_data = {
                         'id': frame_num,
                         'filename': filename,
                         'time_seconds': seconds,
                         'time_formatted': str(timedelta(seconds=seconds))
-                    })
+                    }
+
+                    # Распознавание лиц
+                    if self.options.get('detect_faces'):
+                        face_result = self.detect_faces_on_frame(frame_path)
+                        frame_data['face_detection'] = face_result
+
+                        faces_count = face_result.get('faces_count', 0)
+                        frame_data['faces_count'] = faces_count
+                        total_faces += faces_count
+
+                        logger.debug(
+                            f"[{self.video_name}] Frame {frame_num}: {faces_count} faces")
+
+                    metadata['frames'].append(frame_data)
                     changed = True
 
         if changed:
             metadata['frames'].sort(key=lambda x: x['id'])
             metadata['frames_processed'] = len(metadata['frames'])
+
+            if self.options.get('detect_faces'):
+                metadata['statistics']['total_faces_detected'] = total_faces
+
             self._write_json(metadata)
-            logger.debug(
-                f"[{self.video_name}] Metadata updated: {len(metadata['frames'])} frames")
 
     def mark_completed(self):
         """Отмечает обработку как завершенную."""
@@ -161,7 +208,7 @@ class VideoProcessor:
         metadata['total_frames'] = len(metadata['frames'])
 
         self._write_json(metadata)
-        logger.info(f"[{self.video_name}] Marked as stopped by user")
+        logger.info(f"[{self.video_name}] Marked as stopped")
 
     def mark_error(self, error_msg):
         """Отмечает обработку как ошибочную."""
@@ -188,7 +235,7 @@ class VideoProcessor:
             '-vf', f'fps=1/{interval}',
             '-q:v', '2',
             '-y',
-            '-loglevel', 'error',  # Только ошибки
+            '-loglevel', 'error',
             output_pattern
         ]
 
@@ -206,8 +253,7 @@ class VideoProcessor:
 
             while self.ffmpeg_process.poll() is None:
                 if self.stop_event.is_set():
-                    logger.info(
-                        f"[{self.video_name}] Stop requested, terminating ffmpeg")
+                    logger.info(f"[{self.video_name}] Stop requested")
                     self.ffmpeg_process.terminate()
                     try:
                         self.ffmpeg_process.wait(timeout=5)
@@ -215,24 +261,19 @@ class VideoProcessor:
                         self.ffmpeg_process.kill()
                     break
 
-                # Обновляем метаданные каждую секунду
                 if time.time() - last_update >= 1:
                     self.update_metadata(interval)
                     last_update = time.time()
 
                 time.sleep(0.5)
 
-            # Проверяем результат
             if self.ffmpeg_process.returncode != 0 and not self.stop_event.is_set():
                 stderr = self.ffmpeg_process.stderr.read()
-                error_msg = f"FFmpeg error: {stderr[:200]}"
-                logger.error(f"[{self.video_name}] {error_msg}")
-                raise Exception(error_msg)
+                raise Exception(f"FFmpeg error: {stderr[:200]}")
 
         except FileNotFoundError:
-            raise Exception("FFmpeg not found. Please install ffmpeg.")
+            raise Exception("FFmpeg not found")
 
-        # Финальное обновление
         self.update_metadata(interval)
 
         if self.stop_event.is_set():
@@ -240,8 +281,8 @@ class VideoProcessor:
         else:
             self.mark_completed()
 
-        frames_count = len(self.scan_existing_frames())
-        logger.info(f"[{self.video_name}] Completed. Frames: {frames_count}")
+        logger.info(
+            f"[{self.video_name}] Completed. Frames: {len(self.scan_existing_frames())}")
 
     def _run_async(self, interval):
         """Внутренний метод для запуска в потоке."""
@@ -262,17 +303,14 @@ class VideoProcessor:
 
     def stop(self):
         """Останавливает обработку."""
-        logger.info(f"[{self.video_name}] Stop called")
         self.stop_event.set()
 
     def is_alive(self):
         """Проверяет, выполняется ли обработка."""
-        if self._thread:
-            return self._thread.is_alive()
-        return False
+        return self._thread is not None and self._thread.is_alive()
 
     def get_status(self):
-        """Возвращает статус процессора."""
+        """Возвращает статус."""
         return {
             'video_name': self.video_name,
             'is_alive': self.is_alive(),
