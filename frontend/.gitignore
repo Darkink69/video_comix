@@ -11,6 +11,7 @@ node_modules
 dist
 dist-ssr
 *.local
+mobilenet_v2_140_224
 
 # Editor directories and files
 .vscode/*
