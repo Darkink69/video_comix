@@ -3,6 +3,9 @@ export interface Frame {
   filename: string;
   time_seconds: number;
   time_formatted: string;
+  faces_count?: number;
+  face_detection?: FaceDetectionResult;
+  nsfw_detection?: NSFWDetectionResult;
 }
 
 export interface VideoMetadata {
@@ -37,9 +40,9 @@ export interface VideoSummary {
   frames_interval: number;
   created_at?: string;
   processed_at?: string;
-  options?: ProcessOptions;
   statistics?: {
     total_faces_detected: number;
+    total_nsfw_detected?: number;
   };
 }
 
@@ -125,6 +128,19 @@ export interface ProcessResponse {
   interval: number;
   options: ProcessOptions;
   message: string;
+}
+
+export interface NSFWDetectionResult {
+  is_nsfw: boolean;
+  nsfw_type: "porn" | "sexy" | "hentai" | null;
+  nsfw_score: number;
+  predictions: {
+    drawings: number;
+    hentai: number;
+    neutral: number;
+    porn: number;
+    sexy: number;
+  };
 }
 
 export type SortType = "time" | "name" | "duration";

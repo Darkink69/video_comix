@@ -285,16 +285,17 @@ export const UploadForm: React.FC<UploadFormProps> = ({ onSuccess }) => {
             </label>
 
             {/* NSFW */}
-            <label className="flex items-center p-3 bg-gray-50 rounded-lg opacity-60 cursor-not-allowed border-2 border-transparent">
+            <label className="flex items-center p-3 bg-gray-50 rounded-lg cursor-pointer hover:bg-gray-100 transition-colors border-2 border-transparent hover:border-gray-300">
               <input
                 type="checkbox"
                 checked={options.nsfw}
-                disabled={true}
-                className="w-5 h-5 text-blue-600 border-2 border-gray-300 rounded focus:ring-2 focus:ring-blue-500"
+                onChange={() => handleOptionChange("nsfw")}
+                disabled={loading}
+                className="w-5 h-5 text-blue-600 border-2 border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:ring-offset-0 disabled:opacity-50"
               />
               <span className="ml-3 font-medium text-gray-800">NSFW</span>
               <div className="ml-auto">
-                <Tooltip text="Определение контента для взрослых. Фильтрация неприемлемого контента. В разработке." />
+                <Tooltip text="Определение контента для взрослых (porn, sexy, hentai)." />
               </div>
             </label>
 

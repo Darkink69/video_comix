@@ -210,6 +210,9 @@ def list_videos():
                         processed_at = datetime.fromtimestamp(
                             modified_timestamp).isoformat()
 
+                    # Получаем статистику
+                    statistics = data.get('statistics', {})
+
                     videos.append({
                         'name': folder,
                         'source_path': data.get('source_path', ''),
@@ -226,7 +229,13 @@ def list_videos():
                         'stopped_by_user': data.get('stopped_by_user', False),
                         'frames_interval': data.get('frames_interval', 10),
                         'created_at': created_at,
-                        'processed_at': processed_at
+                        'processed_at': processed_at,
+                        'statistics': {
+                            'total_faces_detected': statistics.get(
+                                'total_faces_detected', 0),
+                            'total_nsfw_detected': statistics.get(
+                                'total_nsfw_detected', 0)
+                        }
                     })
                 except Exception as e:
                     logger.error(f"Error reading {json_file}: {e}")

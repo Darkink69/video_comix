@@ -7,6 +7,7 @@ from datetime import timedelta
 from threading import Thread, Event
 import logging
 from typing import Dict, List, Optional, Tuple, Any
+from utils.nsfw_detector import get_nsfw_tools, NSFWTools
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ class VideoProcessor:
         self.json_path = os.path.join(self.output_dir, f'{video_name}.json')
         self.stop_event = Event()
         self.ffmpeg_process = None
-        self._thread = None
+        self._thread = None  # Добавлено
         self._completed = False
         self._error = None
 
@@ -32,8 +33,9 @@ class VideoProcessor:
             'nsfw': False
         }
 
-        # Детектор лиц (ленивая инициализация)
+        # Детекторы
         self._face_detector = None
+        self._nsfw_tools = None
 
         os.makedirs(self.frames_dir, exist_ok=True)
         logger.info(
@@ -64,6 +66,36 @@ class VideoProcessor:
             logger.error(f"[{self.video_name}] Error getting duration: {e}")
 
         return 0.0
+
+    @property
+    def nsfw_tools(self):
+        """Ленивая инициализация NSFW-детектора."""
+        if self._nsfw_tools is None and self.options.get('nsfw'):
+            self._nsfw_tools = get_nsfw_tools()
+        return self._nsfw_tools
+
+    def detect_nsfw_on_frame(self, frame_path: str) -> Dict[str, Any]:
+        """Определяет NSFW на одном кадре."""
+        if not self.nsfw_tools:
+            return {'is_nsfw': False, 'nsfw_type': None, 'nsfw_score': 0.0,
+                    'predictions': {}}
+
+        predictions = self.nsfw_tools.predict_single(frame_path)
+        nsfw_check = self.nsfw_tools.is_nsfw(predictions)
+
+        return {
+            'is_nsfw': nsfw_check['is_nsfw'],
+            'nsfw_type': nsfw_check['nsfw_type'],
+            'nsfw_score': nsfw_check['nsfw_score'],
+            'predictions': predictions
+        }
+
+    def detect_nsfw_on_folder(self) -> Dict[str, Any]:
+        """Анализирует все кадры в папке на NSFW."""
+        if not self.nsfw_tools:
+            return {'frames': {}, 'nsfw_frames': [], 'statistics': {}}
+
+        return self.nsfw_tools.get_nsfw_frames(self.frames_dir)
 
     def create_initial_metadata(self, interval=10):
         """Создает начальный JSON."""
@@ -137,8 +169,7 @@ class VideoProcessor:
         frame_files = self.scan_existing_frames()
         existing_filenames = {f['filename'] for f in metadata['frames']}
 
-        total_faces = metadata.get('statistics', {}).get('total_faces_detected',
-                                                         0)
+        total_faces = 0
         changed = False
 
         for filename in frame_files:
@@ -161,13 +192,13 @@ class VideoProcessor:
                     if self.options.get('detect_faces'):
                         face_result = self.detect_faces_on_frame(frame_path)
                         frame_data['face_detection'] = face_result
+                        frame_data['faces_count'] = face_result.get(
+                            'faces_count', 0)
 
-                        faces_count = face_result.get('faces_count', 0)
-                        frame_data['faces_count'] = faces_count
-                        total_faces += faces_count
-
-                        logger.debug(
-                            f"[{self.video_name}] Frame {frame_num}: {faces_count} faces")
+                    # NSFW детекция
+                    if self.options.get('nsfw'):
+                        nsfw_result = self.detect_nsfw_on_frame(frame_path)
+                        frame_data['nsfw_detection'] = nsfw_result
 
                     metadata['frames'].append(frame_data)
                     changed = True
@@ -176,10 +207,17 @@ class VideoProcessor:
             metadata['frames'].sort(key=lambda x: x['id'])
             metadata['frames_processed'] = len(metadata['frames'])
 
-            if self.options.get('detect_faces'):
-                metadata['statistics']['total_faces_detected'] = total_faces
+            # Пересчитываем общее количество лиц
+            total_faces = sum(
+                f.get('faces_count', 0) for f in metadata['frames'])
+
+            if 'statistics' not in metadata:
+                metadata['statistics'] = {}
+            metadata['statistics']['total_faces_detected'] = total_faces
 
             self._write_json(metadata)
+            logger.debug(
+                f"[{self.video_name}] Metadata updated: {len(metadata['frames'])} frames, {total_faces} faces")
 
     def mark_completed(self):
         """Отмечает обработку как завершенную."""
@@ -192,9 +230,21 @@ class VideoProcessor:
         metadata['total_frames'] = len(metadata['frames'])
         metadata.pop('total_frames_estimated', None)
 
+        # Подсчитываем статистику NSFW
+        total_nsfw = 0
+        for frame in metadata['frames']:
+            if frame.get('nsfw_detection', {}).get('is_nsfw'):
+                total_nsfw += 1
+
+        # Обновляем статистику
+        if 'statistics' not in metadata:
+            metadata['statistics'] = {}
+        metadata['statistics']['total_nsfw_detected'] = total_nsfw
+
         self._write_json(metadata)
         self._completed = True
-        logger.info(f"[{self.video_name}] Marked as completed")
+        logger.info(
+            f"[{self.video_name}] Marked as completed. Faces: {metadata['statistics'].get('total_faces_detected', 0)}, NSFW: {total_nsfw}")
 
     def mark_stopped(self):
         """Отмечает обработку как остановленную."""
@@ -284,6 +334,30 @@ class VideoProcessor:
         logger.info(
             f"[{self.video_name}] Completed. Frames: {len(self.scan_existing_frames())}")
 
+    def process_async(self, interval=10):
+        """
+        Запускает асинхронную обработку видео.
+        Возвращает поток, в котором выполняется обработка.
+        """
+        logger.info(f"[{self.video_name}] Starting async processing with interval {interval}")
+        self._thread = Thread(target=self._run_async, args=(interval,))
+        self._thread.daemon = True
+        self._thread.start()
+        return self._thread
+
+    def process(self, interval=10):
+        """
+        Синхронная обработка видео (для обратной совместимости).
+        """
+        logger.info(f"[{self.video_name}] Starting sync processing")
+        self.create_initial_metadata(interval)
+        self.extract_frames(interval)
+        return self.json_path
+
+    def is_alive(self):
+        """Проверяет, выполняется ли обработка."""
+        return self._thread is not None and self._thread.is_alive()
+
     def _run_async(self, interval):
         """Внутренний метод для запуска в потоке."""
         try:
@@ -291,30 +365,28 @@ class VideoProcessor:
             self.extract_frames(interval)
         except Exception as e:
             logger.error(f"[{self.video_name}] Async error: {e}")
+            import traceback
+            traceback.print_exc()
             self.mark_error(str(e))
 
-    def process_async(self, interval=10):
-        """Запускает асинхронную обработку."""
-        logger.info(f"[{self.video_name}] Starting async processing")
-        self._thread = Thread(target=self._run_async, args=(interval,))
-        self._thread.daemon = True
-        self._thread.start()
-        return self._thread
+    def detect_nsfw_on_frame(self, frame_path: str) -> Dict[str, Any]:
+        """Определяет NSFW на одном кадре."""
+        if not self.nsfw_tools or not self.nsfw_tools.is_available:
+            return {
+                'is_nsfw': False,
+                'nsfw_type': None,
+                'nsfw_score': 0.0,
+                'predictions': {},
+                'available': False
+            }
 
-    def stop(self):
-        """Останавливает обработку."""
-        self.stop_event.set()
+        predictions = self.nsfw_tools.predict_single(frame_path)
+        nsfw_check = self.nsfw_tools.is_nsfw(predictions)
 
-    def is_alive(self):
-        """Проверяет, выполняется ли обработка."""
-        return self._thread is not None and self._thread.is_alive()
-
-    def get_status(self):
-        """Возвращает статус."""
         return {
-            'video_name': self.video_name,
-            'is_alive': self.is_alive(),
-            'completed': self._completed,
-            'error': self._error,
-            'frames_count': len(self.scan_existing_frames())
+            'is_nsfw': nsfw_check['is_nsfw'],
+            'nsfw_type': nsfw_check['nsfw_type'],
+            'nsfw_score': nsfw_check['nsfw_score'],
+            'predictions': predictions,
+            'available': True
         }
